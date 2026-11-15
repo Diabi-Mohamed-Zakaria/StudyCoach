@@ -35,7 +35,7 @@ def test_bounded_context_keeps_multiple_excerpts_within_budget():
     context = ng._bounded_context(chunks)
     assert len(context) <= ng.MAX_CONTEXT_CHARS + 100
     assert "Argomento 0" in context
-    assert "Argomento 5" in context
+    assert "Argomento 2" in context
     assert "Argomento 14" not in context
 
 
@@ -170,6 +170,257 @@ def test_notes_agent_sets_model_and_completion_limit(monkeypatch):
         "timeout": ng.LLM_TIMEOUT_SECONDS,
     }
     assert "## Riepilogo" in captured["agent"]["description"]
+
+
+def test_notes_team_coordinates_writer_before_independent_review(monkeypatch):
+    captured = {}
+    writer = object()
+
+    monkeypatch.setattr(ng, "_make_notes_agent", lambda *_, **__: writer)
+    monkeypatch.setattr(ng, "make_model", lambda *args, **kwargs: object())
+
+    def fake_team(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(ng, "Team", fake_team)
+    ng._make_notes_team("test-model")
+
+    assert captured["mode"] == ng.TeamMode.coordinate
+    assert captured["members"] == [writer]
+    assert captured["max_iterations"] > 2
+    assert captured["determine_input_for_members"] is False
+    assert captured.get("share_member_interactions", False) is False
+    assert "Delega" in " ".join(captured["instructions"])
+    assert "verifica di fedeltà" in " ".join(captured["instructions"])
+
+
+def test_notes_backup_uses_smaller_output_budgets(monkeypatch):
+    budgets = []
+
+    def make_model(_feature, _name, **kwargs):
+        budgets.append(kwargs["max_tokens"])
+        return object()
+
+    monkeypatch.setattr(ng, "make_model", make_model)
+    monkeypatch.setattr(ng, "Agent", lambda **kwargs: object())
+    monkeypatch.setattr(ng, "Team", lambda **kwargs: object())
+    backup = model_router.ModelChoice("groq", "qwen/qwen3.8-27b")
+    ng._make_notes_team(None, choice=backup)
+    ng._make_notes_review_agent(None, choice=backup)
+    assert budgets == [ng.MAX_FALLBACK_COMPLETION_TOKENS,
+                       ng.MAX_FALLBACK_COMPLETION_TOKENS,
+                       ng.MAX_FALLBACK_REVIEW_TOKENS]
+
+
+def test_team_retries_invalid_structure_with_full_markdown(monkeypatch):
+    class Output:
+        status = "COMPLETED"
+
+        def __init__(self, content):
+            self.content = content
+            self.member_responses = [
+                type("Member", (), {"agent_name": name, "status": "COMPLETED",
+                                    "get_content_as_string": lambda self: "Fatto."})()
+                for name in ("NotesGeneratorAgent", "NotesFidelityReviewAgent")
+            ]
+
+        def get_content_as_string(self):
+            return self.content
+
+    class FakeTeam:
+        model = type("Model", (), {"id": "fake"})()
+
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt, stream=False):
+            self.prompts.append(prompt)
+            return Output("Testo senza heading\n\n## Riepilogo\n- Fatto.") if len(self.prompts) == 1 else Output(
+                "## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto.")
+
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    team = FakeTeam()
+    assert ng._run_with_retry(team, "PROMPT ORIGINALE") == "## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto."
+    assert len(team.prompts) == 2
+    assert "PROMPT ORIGINALE" in team.prompts[1]
+    assert "intero documento corretto in Markdown" in team.prompts[1]
+    assert '"old"' not in team.prompts[1]
+
+
+def test_team_restores_missing_summary_without_second_model_run(monkeypatch):
+    class Member:
+        agent_name = "NotesGeneratorAgent"
+        status = "COMPLETED"
+
+        def get_content_as_string(self):
+            return "Fatto documentato."
+
+    class Output:
+        status = "COMPLETED"
+        member_responses = [Member()]
+
+        def get_content_as_string(self):
+            return "## Tema\nFatto documentato."
+
+    class FakeTeam:
+        model = type("Groq", (), {"id": "backup-model"})()
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, prompt, stream=False):
+            self.calls += 1
+            return Output()
+
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    team = FakeTeam()
+    notes = ng._run_with_retry(team, "PROMPT")
+    assert "## Riepilogo\n- Fatto documentato." in notes
+    assert team.calls == 1
+
+
+def test_team_switches_to_fallback_after_gemini_504(monkeypatch):
+    class Output:
+        def __init__(self, content, status="COMPLETED"):
+            self.content, self.status = content, status
+            self.member_responses = [
+                type("Member", (), {"agent_name": name, "status": "COMPLETED",
+                                    "get_content_as_string": lambda self: "Fatto."})()
+                for name in ("NotesGeneratorAgent", "NotesFidelityReviewAgent")
+            ]
+
+        def get_content_as_string(self):
+            return self.content
+
+    class FakeTeam:
+        def __init__(self, model_id, output):
+            self.model = type("Model", (), {"id": model_id})()
+            self.output = output
+            self.prompts = []
+
+        def run(self, prompt, stream=False):
+            self.prompts.append(prompt)
+            return self.output
+
+    primary = FakeTeam("gemini", Output('{"error":{"code":504,"status":"DEADLINE_EXCEEDED"}}', "ERROR"))
+    backup = FakeTeam("groq", Output("## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto."))
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    monkeypatch.setattr(ng.time, "sleep", lambda *_: pytest.fail("il fallback deve partire senza attesa"))
+
+    result = ng._run_with_retry(primary, "PROMPT", fallback_factory=lambda: backup)
+
+    assert result.startswith("## Capitolo")
+    assert primary.prompts == ["PROMPT"]
+    assert backup.prompts == ["PROMPT"]
+
+
+def test_team_rejects_completed_leader_when_writer_failed(monkeypatch):
+    class Member:
+        def __init__(self, name, content, status):
+            self.agent_name, self.content, self.status = name, content, status
+
+        def get_content_as_string(self):
+            return self.content
+
+    class Output:
+        status = "COMPLETED"
+
+        def get_content_as_string(self):
+            return "## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto."
+
+        member_responses = [
+            Member("NotesGeneratorAgent", '{"error":{"code":503}}', "ERROR"),
+        ]
+
+    class FakeTeam:
+        model = type("Model", (), {"id": "gemini"})()
+
+        def run(self, prompt, stream=False):
+            return Output()
+
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    monkeypatch.setattr(ng, "MAX_LLM_ATTEMPTS", 1)
+    with pytest.raises(ng.ModelServiceUnavailable):
+        ng._run_with_retry(FakeTeam(), "PROMPT")
+
+
+def test_team_retries_missing_writer_with_explicit_delegation(monkeypatch):
+    class Member:
+        status = "COMPLETED"
+
+        def __init__(self, name):
+            self.agent_name = name
+
+        def get_content_as_string(self):
+            return "Fatto."
+
+    class Output:
+        status = "COMPLETED"
+
+        def __init__(self, both):
+            names = ["NotesGeneratorAgent"] if both else []
+            self.member_responses = [Member(name) for name in names]
+
+        def get_content_as_string(self):
+            return "## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto."
+
+    class FakeTeam:
+        model = type("Groq", (), {"id": "backup-model"})()
+
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt, stream=False):
+            self.prompts.append(prompt)
+            return Output(len(self.prompts) == 2)
+
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    monkeypatch.setattr(ng.time, "sleep", lambda *_: pytest.fail("delega incompleta: nessuna attesa"))
+    team = FakeTeam()
+    result = ng._run_with_retry(team, "PROMPT")
+    assert result.startswith("## Capitolo")
+    assert len(team.prompts) == 2
+    assert "NotesGeneratorAgent" in team.prompts[1]
+
+
+def test_team_retries_unstructured_failed_run(monkeypatch):
+    class Member:
+        status = "COMPLETED"
+
+        def __init__(self, name):
+            self.agent_name = name
+
+        def get_content_as_string(self):
+            return "Fatto."
+
+    class Output:
+        def __init__(self, failed):
+            self.status = "ERROR" if failed else "COMPLETED"
+            self.member_responses = [] if failed else [
+                Member("NotesGeneratorAgent"), Member("NotesFidelityReviewAgent")
+            ]
+
+        def get_content_as_string(self):
+            return "Errore senza dettagli strutturati" if self.status == "ERROR" else (
+                "## Capitolo\nFatto.\n\n## Riepilogo\n- Fatto."
+            )
+
+    class FakeTeam:
+        model = type("Groq", (), {"id": "backup-model"})()
+
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt, stream=False):
+            self.prompts.append(prompt)
+            return Output(len(self.prompts) == 1)
+
+    monkeypatch.setattr(ng, "Team", FakeTeam)
+    monkeypatch.setattr(ng.time, "sleep", lambda *_: pytest.fail("errore senza dettagli: nessuna attesa"))
+    team = FakeTeam()
+    assert ng._run_with_retry(team, "PROMPT").startswith("## Capitolo")
+    assert len(team.prompts) == 2
 
 
 def test_notes_review_uses_json_mode_and_separate_token_budget(monkeypatch):
@@ -315,7 +566,7 @@ def test_fidelity_review_removes_only_unsupported_claim(monkeypatch):
             assert "Leopardi parla della memoria" in prompt
             return Output()
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     notes = (
         "## Memoria\nLeopardi parla della memoria.\nDante ha scritto i Promessi Sposi.\n"
         "\n## Riepilogo\n- Il testo tratta la memoria."
@@ -342,7 +593,7 @@ def test_fidelity_review_retries_empty_model_response(monkeypatch):
             calls.append(prompt)
             return Output(next(responses))
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     monkeypatch.setattr(ng.time, "sleep", lambda *_: None)
     notes = "## Tema\nFatto documentato.\n\n## Riepilogo\n- Fatto documentato."
     assert ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake") == notes
@@ -368,11 +619,74 @@ def test_fidelity_review_retries_gemini_503(monkeypatch):
             calls.append(prompt)
             return Output(next(responses))
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     monkeypatch.setattr(ng.time, "sleep", lambda *_: None)
     notes = "## Tema\nFatto documentato.\n\n## Riepilogo\n- Fatto documentato."
     assert ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake") == notes
     assert len(calls) == 2
+
+
+def test_fidelity_review_uses_backup_after_primary_quota(monkeypatch):
+    backup = model_router.ModelChoice("groq", "backup-model")
+    choices = []
+
+    class Output:
+        def __init__(self, content):
+            self.content = content
+
+        def get_content_as_string(self):
+            return self.content
+
+    class Agent:
+        def __init__(self, content):
+            self.content = content
+
+        def run(self, prompt, stream=False):
+            return Output(self.content)
+
+    def make_review(_model_name, *, choice=None):
+        choices.append(choice)
+        return Agent('{"unsupported": []}' if choice == backup else
+                     '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED",'
+                     '"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure",'
+                     '"violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}')
+
+    monkeypatch.setattr(ng, "fallback_choice", lambda *_: backup)
+    monkeypatch.setattr(ng, "_make_notes_review_agent", make_review)
+    notes = "## Tema\nFatto documentato.\n\n## Riepilogo\n- Fatto documentato."
+    assert ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake") == notes
+    assert choices == [None, backup]
+
+
+def test_fidelity_review_preserves_required_summary_heading(monkeypatch):
+    class Output:
+        def get_content_as_string(self):
+            return '{"unsupported": ["## Riepilogo"]}'
+
+    class Agent:
+        def run(self, prompt, stream=False):
+            return Output()
+
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
+    notes = "## Tema\nFatto documentato.\n\n## Riepilogo\n- Fatto documentato."
+    assert ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake") == notes
+
+
+def test_fidelity_review_rebuilds_empty_summary_from_verified_body(monkeypatch):
+    class Output:
+        def get_content_as_string(self):
+            return '{"unsupported": ["Fatto inventato."]}'
+
+    class Agent:
+        def run(self, prompt, stream=False):
+            return Output()
+
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
+    notes = ("## Tema\nFatto documentato.\nFatto inventato.\n\n"
+             "## Riepilogo\n- Fatto inventato.")
+    revised = ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake")
+    assert "Fatto inventato." not in revised
+    assert "## Riepilogo\n- Fatto documentato." in revised
 
 
 def test_fidelity_review_retries_paraphrased_unsupported_claim(monkeypatch):
@@ -391,7 +705,7 @@ def test_fidelity_review_retries_paraphrased_unsupported_claim(monkeypatch):
             calls.append(prompt)
             return Output()
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     notes = ("## Tema\nFatto documentato.\nDante ha scritto i Promessi Sposi.\n\n"
              "## Riepilogo\n- Fatto documentato.")
     result = ng._verify_notes_fidelity(notes, "Fatto documentato.", "fake")
@@ -412,7 +726,7 @@ def test_fidelity_review_never_accepts_repeated_empty_response(monkeypatch):
             calls.append(prompt)
             return Output()
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     monkeypatch.setattr(ng.time, "sleep", lambda *_: None)
     with pytest.raises(ng.NotesReviewUnavailable):
         ng._verify_notes_fidelity("## Tema\nFatto.\n\n## Riepilogo\n- Fatto.", "Fatto.", "fake")
@@ -431,7 +745,7 @@ def test_fidelity_review_exposes_rate_limit_instead_of_empty_review(monkeypatch)
             calls.append(prompt)
             return Output()
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     with pytest.raises(ng.RetryableLLMError) as caught:
         ng._verify_notes_fidelity("## Tema\nFatto.\n\n## Riepilogo\n- Fatto.", "Fatto.", "fake")
     assert ng.is_rate_limit_error(caught.value)
@@ -448,7 +762,7 @@ def test_fidelity_review_rejects_unverifiable_review_output(monkeypatch):
         def run(self, prompt, stream=False):
             return Output()
 
-    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_: Agent())
+    monkeypatch.setattr(ng, "_make_notes_review_agent", lambda *_, **__: Agent())
     with pytest.raises(ng.NotesReviewUnavailable, match="verifica"):
         ng._verify_notes_fidelity(
             "## Tema\nFatto documentato.\n\n## Riepilogo\n- Fatto documentato.",
@@ -552,11 +866,11 @@ def test_extract_weak_topics_filters_low_scores_and_dedupes():
 # ---------------------------------------------------------------------------
 
 def test_generate_notes_returns_agent_output(monkeypatch, fake_agent_factory):
-    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_: notes)
+    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_, **__: notes)
     monkeypatch.setattr(ng, "retrieve_passages", lambda **kwargs: [
         {"text": "chunk di materiale " * 20, "source": "Analisi 1", "page": 1}
     ])
-    monkeypatch.setattr(ng, "_make_notes_agent", fake_agent_factory(FAKE_VALID_NOTES))
+    monkeypatch.setattr(ng, "_make_notes_team", fake_agent_factory(FAKE_VALID_NOTES))
 
     notes = ng.generate_notes(student_id=1, exam_id=1, source_name="Analisi 1")
     assert notes == FAKE_VALID_NOTES.strip()
@@ -569,6 +883,28 @@ def test_generate_notes_pdf_preserves_accents_and_symbols(monkeypatch):
     from pypdf import PdfReader
     text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf_bytes)).pages)
     assert "Perché è già così" in text
+
+
+def test_pdf_markdown_table_wraps_and_repeats_header_across_pages():
+    from pypdf import PdfReader
+
+    pdf = ng._NotesPDF("Appunti")
+    pdf.add_page()
+    rows = "\n".join(
+        f"| Caso {i} | Descrizione estesa del caso {i}. " + "Dettaglio tecnico. " * 8 + "|"
+        for i in range(1, 32)
+    )
+    ng._render_markdown(
+        pdf, "## Tabella\n\n| Caso | Descrizione |\n| --- | --- |\n" + rows
+    )
+    pages = PdfReader(io.BytesIO(bytes(pdf.output())))
+    assert len(pages.pages) > 1
+    for page in pages.pages:
+        assert "Caso" in page.extract_text()
+        assert "Descrizione" in page.extract_text()
+    all_text = "\n".join(page.extract_text() for page in pages.pages)
+    assert "Caso 1" in all_text and "Caso 31" in all_text
+    assert "| --- |" not in all_text
 
 
 def test_pdf_notes_do_not_substitute_another_source(monkeypatch):
@@ -585,8 +921,8 @@ def test_pdf_notes_report_actual_source_and_part_progress(monkeypatch):
          "source": "letteratura.pdf", "page": 1}
     ])
     monkeypatch.setattr(ng, "_run_with_retry", lambda *args, **kwargs: "## Tema\nFatto.\n\n## Riepilogo\n- Fatto.")
-    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_: notes)
-    monkeypatch.setattr(ng, "_make_notes_agent", lambda *_: object())
+    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_, **__: notes)
+    monkeypatch.setattr(ng, "_make_notes_team", lambda *_: object())
     events = []
     pdf = ng.generate_notes_pdf_from_materials(
         1, 1, [{"filename": "letteratura.pdf"}], progress=events.append,
@@ -615,13 +951,13 @@ def test_generate_notes_raises_without_material(monkeypatch):
 
 
 def test_generate_notes_retries_on_invalid_response(monkeypatch, fake_agent_factory):
-    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_: notes)
+    monkeypatch.setattr(ng, "_verify_notes_fidelity", lambda notes, *_, **__: notes)
     monkeypatch.setattr(ng, "retrieve_passages", lambda **kwargs: [
         {"text": "chunk di materiale " * 20, "source": "materiale di studio", "page": 1}
     ])
     monkeypatch.setattr(ng.time, "sleep", lambda *_: None)
     # Prima risposta troppo corta (non valida) -> ritenta -> seconda risposta valida
-    monkeypatch.setattr(ng, "_make_notes_agent", fake_agent_factory(["troppo corta", FAKE_VALID_NOTES]))
+    monkeypatch.setattr(ng, "_make_notes_team", fake_agent_factory(["troppo corta", FAKE_VALID_NOTES]))
 
     notes = ng.generate_notes(student_id=1, exam_id=1)
     assert notes == FAKE_VALID_NOTES.strip()
